@@ -120,6 +120,4 @@ Public and private leaderboard scores were analyzed to understand generalization
 
 Final Result
 
-Rank: 1162 out of 4317 teams
-
 Top ~27% on the leaderboard
