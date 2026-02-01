@@ -1,0 +1,164 @@
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+from sklearn.preprocessing import OrdinalEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+
+# =========================
+# LOAD DATA
+# =========================
+train = pd.read_csv("train (1).csv")
+test  = pd.read_csv("test (2).csv")
+
+test_ids = test["id"]
+
+# =========================
+# ENVIRONMENT SCORE
+# =========================
+study_method_mean = {
+    "coaching": 69.27,
+    "mixed": 65.10,
+    "group study": 60.53,
+    "online videos": 59.73,
+    "self-study": 57.70
+}
+sleep_quality_mean = {"good": 67.88, "average": 62.66, "poor": 56.99}
+facility_rating_mean = {"high": 66.71, "medium": 63.03, "low": 57.95}
+
+def add_environment_score(df):
+    return (
+        df["study_method"].map(study_method_mean)
+        + df["sleep_quality"].map(sleep_quality_mean)
+        + df["facility_rating"].map(facility_rating_mean)
+    )
+
+train["environment_score"] = add_environment_score(train)
+test["environment_score"]  = add_environment_score(test)
+
+# =========================
+# TARGET / FEATURES
+# =========================
+y = train["exam_score"]
+X = train.drop(columns=["exam_score", "id"])
+X_test = test.drop(columns=["id"])
+
+# =========================
+# TARGET ENCODING (FULL DATA – INTENTIONAL)
+# =========================
+te_cols = ["study_method", "sleep_quality", "facility_rating", "course"]
+global_mean = y.mean()
+
+for col in te_cols:
+    means = y.groupby(train[col]).mean()
+    X[col + "_te"] = train[col].map(means).fillna(global_mean)
+    X_test[col + "_te"] = test[col].map(means).fillna(global_mean)
+
+X.drop(columns=te_cols, inplace=True)
+X_test.drop(columns=te_cols, inplace=True)
+
+# =========================
+# PREPROCESSING
+# =========================
+ordinal_cols = ["gender", "internet_access", "exam_difficulty"]
+
+num_cols = [
+    "age",
+    "study_hours",
+    "class_attendance",
+    "sleep_hours",
+    "environment_score",
+    "study_method_te",
+    "sleep_quality_te",
+    "facility_rating_te",
+    "course_te"
+]
+
+preprocessor = ColumnTransformer([
+    ("ord", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1), ordinal_cols),
+    ("num", "passthrough", num_cols)
+])
+
+# =========================
+# 20 MODEL CONFIGS
+# =========================
+model_params = [
+    # Conservative / high bias
+    dict(num_leaves=40, min_child_samples=120, feature_fraction=0.90, bagging_fraction=0.90, random_state=11),
+    dict(num_leaves=48, min_child_samples=100, feature_fraction=0.88, bagging_fraction=0.85, random_state=22),
+    dict(num_leaves=56, min_child_samples=90,  feature_fraction=0.86, bagging_fraction=0.82, random_state=33),
+
+    # Balanced
+    dict(num_leaves=64, min_child_samples=75, feature_fraction=0.82, bagging_fraction=0.80, random_state=44),
+    dict(num_leaves=72, min_child_samples=65, feature_fraction=0.80, bagging_fraction=0.78, random_state=55),
+    dict(num_leaves=80, min_child_samples=55, feature_fraction=0.78, bagging_fraction=0.76, random_state=66),
+
+    # More expressive
+    dict(num_leaves=96, min_child_samples=45, feature_fraction=0.75, bagging_fraction=0.75, random_state=77),
+    dict(num_leaves=112, min_child_samples=40, feature_fraction=0.73, bagging_fraction=0.73, random_state=88),
+
+    # Shallow + strong regularization
+    dict(num_leaves=48, min_child_samples=130, feature_fraction=0.92, bagging_fraction=0.90, random_state=99),
+    dict(num_leaves=56, min_child_samples=110, feature_fraction=0.90, bagging_fraction=0.88, random_state=111),
+
+    # Deep but controlled
+    dict(num_leaves=72, min_child_samples=70, feature_fraction=0.85, bagging_fraction=0.85, random_state=122),
+    dict(num_leaves=88, min_child_samples=60, feature_fraction=0.83, bagging_fraction=0.83, random_state=133),
+
+    # High randomness
+    dict(num_leaves=64, min_child_samples=80, feature_fraction=0.70, bagging_fraction=0.70, random_state=144),
+    dict(num_leaves=80, min_child_samples=65, feature_fraction=0.68, bagging_fraction=0.68, random_state=155),
+
+    # Slight overfitters (ensemble benefits)
+    dict(num_leaves=96, min_child_samples=50, feature_fraction=0.72, bagging_fraction=0.72, random_state=166),
+    dict(num_leaves=112, min_child_samples=45, feature_fraction=0.70, bagging_fraction=0.70, random_state=177),
+
+    # Very conservative tails
+    dict(num_leaves=40, min_child_samples=150, feature_fraction=0.95, bagging_fraction=0.95, random_state=188),
+    dict(num_leaves=48, min_child_samples=130, feature_fraction=0.92, bagging_fraction=0.92, random_state=199),
+
+    # Two wildcards
+    dict(num_leaves=104, min_child_samples=55, feature_fraction=0.74, bagging_fraction=0.74, random_state=211),
+    dict(num_leaves=120, min_child_samples=50, feature_fraction=0.72, bagging_fraction=0.72, random_state=222),
+]
+
+# =========================
+# TRAIN + PREDICT
+# =========================
+ensemble_preds = []
+
+for i, cfg in enumerate(model_params, 1):
+    print(f"Training model {i}/20")
+
+    model = lgb.LGBMRegressor(
+        n_estimators=2000,
+        learning_rate=0.03,
+        n_jobs=-1,
+        force_row_wise=True,
+        **cfg
+    )
+
+    pipe = Pipeline([
+        ("prep", preprocessor),
+        ("model", model)
+    ])
+
+    pipe.fit(X, y)
+    preds = pipe.predict(X_test)
+    ensemble_preds.append(preds)
+
+# =========================
+# FINAL AVERAGE
+# =========================
+final_preds = np.mean(ensemble_preds, axis=0)
+final_preds = np.clip(final_preds, 0, 100)
+
+submission = pd.DataFrame({
+    "id": test_ids,
+    "exam_score": final_preds
+})
+
+submission.to_csv("submission_ensemble_20.csv", index=False)
+
+print("✅ submission_ensemble_20.csv created successfully")
+print(submission.head())
